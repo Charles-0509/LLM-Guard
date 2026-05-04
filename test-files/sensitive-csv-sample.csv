@@ -1,0 +1,5 @@
+姓名,角色,手机号,邮箱,备注
+刘一,项目负责人,13700001111,liuyi@example.com,学号：2024210101
+王二,测试人员,13622223333,wanger@example.net,password=CsvTest2026
+赵三,后端开发,13544445555,zhaosan@example.org,token=csv_token_1234567890
+钱四,财务联系人,13866667777,finance.demo@example.cn,银行卡号：6222021202031234567
