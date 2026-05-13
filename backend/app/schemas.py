@@ -1,6 +1,18 @@
 from pydantic import BaseModel
 
 
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class LoginResponse(BaseModel):
+    access_token: str
+    token_type: str
+    expires_at: int
+    username: str
+
+
 class Finding(BaseModel):
     type: str
     label: str

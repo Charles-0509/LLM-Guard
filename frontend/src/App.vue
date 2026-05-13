@@ -6,13 +6,17 @@ import {
   ClipboardCheck,
   Download,
   FileSearch,
+  KeyRound,
   Loader2,
+  LogOut,
   ShieldCheck,
   Upload,
 } from 'lucide-vue-next'
 import ResultBlock from './components/ResultBlock.vue'
 
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:8010'
+const TOKEN_KEY = 'llm_guard_token'
+const USERNAME_KEY = 'llm_guard_username'
 
 const promptText = ref('')
 const mode = ref('mask')
@@ -23,6 +27,12 @@ const selectedFile = ref(null)
 const promptLoading = ref(false)
 const fileLoading = ref(false)
 const errorMessage = ref('')
+const loginUsername = ref('')
+const loginPassword = ref('')
+const loginLoading = ref(false)
+const loginError = ref('')
+const authToken = ref(localStorage.getItem(TOKEN_KEY) || '')
+const currentUser = ref(localStorage.getItem(USERNAME_KEY) || '')
 
 const modeLabel = computed(() => {
   if (mode.value === 'placeholder') return '占位符'
@@ -30,16 +40,73 @@ const modeLabel = computed(() => {
   return '默认遮蔽'
 })
 
+const isAuthenticated = computed(() => Boolean(authToken.value))
+
+async function login() {
+  loginError.value = ''
+  loginLoading.value = true
+  try {
+    const response = await fetch(`${API_BASE}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username: loginUsername.value,
+        password: loginPassword.value,
+      }),
+    })
+    if (!response.ok) throw new Error(await readError(response))
+    const data = await response.json()
+    authToken.value = data.access_token
+    currentUser.value = data.username
+    localStorage.setItem(TOKEN_KEY, data.access_token)
+    localStorage.setItem(USERNAME_KEY, data.username)
+    loginPassword.value = ''
+  } catch (error) {
+    loginError.value = error.message
+  } finally {
+    loginLoading.value = false
+  }
+}
+
+function logout() {
+  clearSession()
+}
+
+function clearSession() {
+  authToken.value = ''
+  currentUser.value = ''
+  localStorage.removeItem(TOKEN_KEY)
+  localStorage.removeItem(USERNAME_KEY)
+  promptResult.value = null
+  fileResult.value = null
+}
+
+function authHeaders(headers = {}) {
+  return {
+    ...headers,
+    Authorization: `Bearer ${authToken.value}`,
+  }
+}
+
+async function requireOk(response) {
+  if (response.status === 401) {
+    const message = await readError(response)
+    clearSession()
+    throw new Error(message)
+  }
+  if (!response.ok) throw new Error(await readError(response))
+}
+
 async function scanPrompt() {
   errorMessage.value = ''
   promptLoading.value = true
   try {
     const response = await fetch(`${API_BASE}/api/scan/prompt`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ text: promptText.value, mode: mode.value }),
     })
-    if (!response.ok) throw new Error(await readError(response))
+    await requireOk(response)
     promptResult.value = await response.json()
     await revealResults()
   } catch (error) {
@@ -63,9 +130,10 @@ async function scanFile() {
   try {
     const response = await fetch(`${API_BASE}/api/scan/file`, {
       method: 'POST',
+      headers: authHeaders(),
       body: formData,
     })
-    if (!response.ok) throw new Error(await readError(response))
+    await requireOk(response)
     fileResult.value = await response.json()
     await revealResults()
   } catch (error) {
@@ -93,6 +161,28 @@ function downloadUrl(fileId) {
   return `${API_BASE}/api/files/${encodeURIComponent(fileId)}`
 }
 
+async function downloadFile() {
+  if (!fileResult.value) return
+  errorMessage.value = ''
+  try {
+    const response = await fetch(downloadUrl(fileResult.value.file_id), {
+      headers: authHeaders(),
+    })
+    await requireOk(response)
+    const blob = await response.blob()
+    const objectUrl = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = objectUrl
+    link.download = fileResult.value.redacted_filename || 'redacted-file'
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    URL.revokeObjectURL(objectUrl)
+  } catch (error) {
+    errorMessage.value = error.message
+  }
+}
+
 function copyRedacted() {
   if (promptResult.value?.redacted_text) {
     navigator.clipboard.writeText(promptResult.value.redacted_text)
@@ -106,20 +196,52 @@ async function revealResults() {
 </script>
 
 <template>
-  <main class="shell">
+  <main v-if="!isAuthenticated" class="shell auth-shell">
+    <section class="auth-card">
+      <p class="eyebrow">LLM-Guard</p>
+      <h1>登录隐私脱敏工作台</h1>
+      <p class="subtitle">请输入账号密码后继续使用提示词与文档检测服务。</p>
+      <form class="login-form" @submit.prevent="login">
+        <label>
+          账号
+          <input v-model="loginUsername" autocomplete="username" placeholder="请输入账号" />
+        </label>
+        <label>
+          密码
+          <input v-model="loginPassword" autocomplete="current-password" placeholder="请输入密码" type="password" />
+        </label>
+        <p v-if="loginError" class="error">{{ loginError }}</p>
+        <button class="primary wide" :disabled="loginLoading">
+          <Loader2 v-if="loginLoading" class="spin" :size="18" />
+          <KeyRound v-else :size="18" />
+          登录
+        </button>
+      </form>
+    </section>
+  </main>
+
+  <main v-else class="shell">
     <section class="masthead">
       <div>
         <p class="eyebrow">LLM-Guard</p>
         <h1>提示词与文档隐私脱敏工作台</h1>
         <p class="subtitle">在发送给大模型之前，检测文本和附件中的敏感信息、密钥泄露与提示注入风险。</p>
       </div>
-      <div class="status-strip">
-        <span>txt</span>
-        <span>csv</span>
-        <span>docx</span>
-        <span>xlsx</span>
-        <span>pdf</span>
-        <span>pptx</span>
+      <div class="masthead-side">
+        <div class="user-chip">
+          <span>{{ currentUser }}</span>
+          <button class="icon-button" title="退出登录" @click="logout">
+            <LogOut :size="17" />
+          </button>
+        </div>
+        <div class="status-strip">
+          <span>txt</span>
+          <span>csv</span>
+          <span>docx</span>
+          <span>xlsx</span>
+          <span>pdf</span>
+          <span>pptx</span>
+        </div>
       </div>
     </section>
 
@@ -193,10 +315,10 @@ async function revealResults() {
         <template #content>
           <div class="file-download">
             <span>{{ fileResult.redacted_filename }}</span>
-            <a :href="downloadUrl(fileResult.file_id)">
+            <button class="download-button" @click="downloadFile">
               <Download :size="18" />
               下载脱敏文件
-            </a>
+            </button>
           </div>
           <h3>文本预览</h3>
           <pre class="file-preview">{{ fileResult.preview || '该文件未提取到可预览文本，或未发现需要替换的内容。' }}</pre>

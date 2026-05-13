@@ -24,6 +24,52 @@ input {
   padding: 32px;
 }
 
+.auth-shell {
+  display: grid;
+  place-items: center;
+}
+
+.auth-card {
+  width: min(520px, 100%);
+  border: 1px solid #dce2d5;
+  border-radius: 8px;
+  padding: 28px;
+  background: #ffffff;
+}
+
+.auth-card h1 {
+  font-size: 34px;
+}
+
+.login-form {
+  display: grid;
+  gap: 14px;
+  margin-top: 24px;
+}
+
+.login-form label {
+  display: grid;
+  gap: 8px;
+  color: #263631;
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.login-form input {
+  width: 100%;
+  min-height: 44px;
+  border: 1px solid #cbd6d0;
+  border-radius: 8px;
+  padding: 0 12px;
+  color: #14211d;
+  outline: none;
+}
+
+.login-form input:focus {
+  border-color: #1f6f58;
+  box-shadow: 0 0 0 3px rgba(31, 111, 88, 0.16);
+}
+
 .masthead {
   display: flex;
   align-items: flex-end;
@@ -69,6 +115,35 @@ h1 {
   flex-wrap: wrap;
   gap: 8px;
   justify-content: flex-end;
+}
+
+.masthead-side {
+  display: grid;
+  gap: 14px;
+  justify-items: end;
+}
+
+.user-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid #cfd9cf;
+  border-radius: 999px;
+  padding: 5px 6px 5px 12px;
+  background: #ffffff;
+  color: #36524a;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.icon-button {
+  min-height: 30px;
+  width: 30px;
+  border: 0;
+  border-radius: 999px;
+  padding: 0;
+  background: #eef4ed;
+  color: #1f6f58;
 }
 
 .status-strip span {
@@ -203,7 +278,8 @@ textarea:focus {
 }
 
 button,
-.file-download a {
+.file-download a,
+.download-button {
   display: inline-flex;
   min-height: 42px;
   align-items: center;
@@ -394,8 +470,10 @@ pre {
   color: #43554f;
 }
 
-.file-download a {
+.file-download a,
+.download-button {
   flex: none;
+  border: 0;
   background: #1f6f58;
   color: white;
   font-weight: 800;
@@ -487,6 +565,10 @@ code {
   .toolbar {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .masthead-side {
+    justify-items: start;
   }
 
   h1 {
