@@ -3,12 +3,13 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 
 from .auth import authenticate_user, create_session, init_auth_db, require_user
 from .file_handlers import REDACTED_DIR, redact_file, save_upload
+from .proxy import proxy_openai_request
 from .scanner import build_summary, scan_text
 from .schemas import FileScanResponse, LoginRequest, LoginResponse, PromptScanRequest, PromptScanResponse
 
@@ -30,6 +31,11 @@ app.add_middleware(
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.api_route("/v1/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
+async def proxy_openai(path: str, request: Request):
+    return await proxy_openai_request(path, request)
 
 
 @app.on_event("startup")
