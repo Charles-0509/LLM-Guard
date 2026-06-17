@@ -46,3 +46,7 @@ temp/
 *.tmp
 *.bak
 *.swp
+
+#AI Products
+CLAUDE.md
+skills/

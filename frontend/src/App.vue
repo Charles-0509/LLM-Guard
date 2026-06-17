@@ -68,7 +68,18 @@ async function login() {
   }
 }
 
-function logout() {
+async function logout() {
+  const token = authToken.value
+  if (token) {
+    try {
+      await fetch(`${API_BASE}/api/auth/logout`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      })
+    } catch {
+      // Best-effort server-side revoke; clear locally regardless.
+    }
+  }
   clearSession()
 }
 

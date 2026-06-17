@@ -1,9 +1,13 @@
-from pydantic import BaseModel
+from __future__ import annotations
+
+from typing import Literal
+
+from pydantic import BaseModel, Field
 
 
 class LoginRequest(BaseModel):
-    username: str
-    password: str
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=1, max_length=256)
 
 
 class LoginResponse(BaseModel):
@@ -33,8 +37,8 @@ class DetectionSummary(BaseModel):
 
 
 class PromptScanRequest(BaseModel):
-    text: str
-    mode: str = "mask"
+    text: str = Field(max_length=200_000)
+    mode: Literal["mask", "placeholder", "remove"] = "mask"
 
 
 class PromptScanResponse(BaseModel):

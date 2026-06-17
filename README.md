@@ -56,12 +56,22 @@ npm run dev
 
 ## 账号登录
 
-系统内置了一个简单的账号密码验证层。后端使用 SQLite 保存账号、随机盐和 PBKDF2-HMAC-SHA256 哈希后的密码，不保存明文密码。登录成功后，后端会生成随机会话令牌，前端通过 `Authorization: Bearer <token>` 访问检测和文件下载接口。
+系统内置了一个简单的账号密码验证层。后端使用 SQLite 保存账号、随机盐和 PBKDF2-HMAC-SHA256 哈希后的密码，不保存明文密码。登录成功后，后端会生成随机会话令牌，前端通过 `Authorization: Bearer <token>` 访问检测和文件下载接口。会话默认有效期为 8 小时，登出时会在后端撤销该令牌。
 
-首次启动后端时，如果数据库中不存在初始账号，系统会自动创建：
+首次启动后端时，如果数据库中还没有任何账号，系统会创建一个初始管理员账号。**系统不再内置任何默认弱口令**，初始凭据按以下优先级解析：
 
-- 账号：`charles`
-- 密码：`Charles939433.`
+1. 进程环境变量 `LLM_GUARD_INITIAL_USERNAME` / `LLM_GUARD_INITIAL_PASSWORD`；
+2. `backend/.env` 文件中的同名配置项；
+3. 若以上都没有提供，且当前是交互式终端，会提示在命令行手动输入初始账号和密码。
+
+如果既没有 `.env`、环境变量，又不是交互式终端（例如用 Docker、systemd、CI 启动），后端会直接报错退出，拒绝以空账号或弱口令运行。初始密码要求至少 8 位。
+
+推荐做法是复制示例文件并填写：
+
+```bash
+cp backend/.env.example backend/.env
+# 编辑 backend/.env，设置 LLM_GUARD_INITIAL_USERNAME 与 LLM_GUARD_INITIAL_PASSWORD
+```
 
 账号数据库默认位于：
 
@@ -69,15 +79,7 @@ npm run dev
 backend/storage/llm_guard.sqlite3
 ```
 
-可以通过环境变量覆盖初始账号和密码：
-
-```bash
-export LLM_GUARD_INITIAL_USERNAME=yourname
-export LLM_GUARD_INITIAL_PASSWORD='your-strong-password'
-export LLM_GUARD_SESSION_SECONDS=86400
-```
-
-初始账号只会在不存在时创建。数据库已经创建后，再修改环境变量不会自动改旧账号密码；如需重置演示环境，可以先停止服务，再删除 `backend/storage/llm_guard.sqlite3` 后重新启动。
+初始账号只会在数据库为空时创建一次。数据库已经创建后，再修改 `.env` 或环境变量不会自动改旧账号密码；如需重置环境，可以先停止服务，再删除 `backend/storage/llm_guard.sqlite3` 后重新启动。
 
 ## 脱敏原理
 
@@ -138,7 +140,9 @@ Codex / OpenAI SDK
   -> 中转站 / 模型服务
 ```
 
-代理接口只覆盖 `/v1/{path}`，不会影响网页登录和原有 `/api/*` 接口。`/api/*` 仍然需要网页登录令牌，`/v1/*` 默认不额外要求网页登录，建议只监听 `127.0.0.1` 供本机使用。
+代理接口只覆盖 `/v1/{path}`，不会影响网页登录和原有 `/api/*` 接口。`/api/*` 仍然需要网页登录令牌。`/v1/*` 的访问控制由独立的代理密钥决定：设置 `LLM_GUARD_PROXY_API_KEY` 后，客户端必须用 `Authorization: Bearer <该密钥>` 才能访问代理，否则返回 `401`。建议无论是否设置密钥，都只监听 `127.0.0.1` 供本机使用。
+
+为避免凭据泄露给上游，代理**不会**把客户端发来的 `Authorization`、`Cookie`、`X-Api-Key`、`X-Forwarded-*` 等敏感头转发出去；发往真实上游的凭据由服务端通过 `LLM_GUARD_PROXY_UPSTREAM_AUTHORIZATION` 注入。代理还会校验上游地址：协议必须是 http/https，且拒绝指向内网、回环、链路本地等地址，降低 SSRF 风险。
 
 后端代理环境变量：
 
@@ -146,6 +150,8 @@ Codex / OpenAI SDK
 LLM_GUARD_PROXY_UPSTREAM=https://你的中转站地址/v1
 LLM_GUARD_PROXY_MODE=mask
 LLM_GUARD_PROXY_ENABLED=true
+LLM_GUARD_PROXY_API_KEY=本机代理访问密钥（可选但强烈建议）
+LLM_GUARD_PROXY_UPSTREAM_AUTHORIZATION=Bearer sk-真实上游密钥
 ```
 
 说明：

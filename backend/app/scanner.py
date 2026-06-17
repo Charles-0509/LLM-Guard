@@ -18,13 +18,13 @@ RULES: list[Rule] = [
     Rule("phone", "手机号", "medium", re.compile(r"(?<!\d)1[3-9]\d{9}(?!\d)")),
     Rule("db_credential", "数据库连接凭据", "critical", re.compile(r"(?i)\b(?:mysql|postgresql|postgres|mongodb|redis)://[^:@\s'\"<>]*:[^@\s'\"<>]+@[^\s'\"<>]+")),
     Rule("email", "邮箱地址", "medium", re.compile(r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![A-Za-z0-9_%+-])")),
-    Rule("address", "地址", "medium", re.compile(r"[\u4e00-\u9fa5]{2,}(?:省|市|自治区|自治州|区|县|镇|乡|街道|路|街|巷|小区|大街)[\u4e00-\u9fa5A-Za-z0-9\-号室单元栋幢弄院]+")),
+    Rule("address", "地址", "medium", re.compile(r"[\u4e00-\u9fa5]{2,20}(?:省|市|自治区|自治州|区|县|镇|乡|街道|路|街|巷|小区|大街)[\u4e00-\u9fa5A-Za-z0-9\-号室单元栋幢弄院]{1,40}")),
     Rule("student_id", "学号 / 工号", "medium", re.compile(r"(?:学号|工号)\s*(?:是|为)?\s*[:=：]?\s*\d{6,14}")),
-    Rule("bank_card", "银行卡号", "high", re.compile(r"(?<!\d)(?:\d[ -]?){16,19}(?!\d)")),
-    Rule("password", "密码字段", "critical", re.compile(r"(?i)(?:\b(?:password|passwd|pwd)\b|(?:数据库)?(?:口令|密码))\s*[:=：]\s*['\"]?([^\s,'\";，。]{4,})")),
-    Rule("api_key", "API Key / Token", "critical", re.compile(r"(?i)(?:\b(?:api[_-]?key|access[_-]?token|secret[_-]?key|bearer)\b\s*(?:[:=：]|是|为)?\s*['\"]?[A-Za-z0-9._\-]{8,}|sk-[A-Za-z0-9_-]{8,})")),
-    Rule("url_secret", "URL 敏感参数", "high", re.compile(r"(?i)(?:token|key|secret|password|pwd)=([^&\s]+)")),
-    Rule("prompt_injection", "提示注入风险", "high", re.compile(r"(?i)(忽略.*(?:规则|指令|限制)|泄露.*(?:系统提示词|system prompt)|ignore (?:all )?(?:previous|prior) instructions|reveal (?:the )?system prompt|developer message|jailbreak)")),
+    Rule("bank_card", "银行卡号", "high", re.compile(r"(?<!\d)\d(?:[ -]?\d){15,18}(?!\d)")),
+    Rule("password", "密码字段", "critical", re.compile(r"(?i)(?:\b(?:password|passwd|pwd)\b|(?:数据库)?(?:口令|密码))\s*[:=：]\s*['\"]?([^\s,'\";，。]{4,256})")),
+    Rule("api_key", "API Key / Token", "critical", re.compile(r"(?i)(?:\b(?:api[_-]?key|access[_-]?token|secret[_-]?key|bearer)\b\s*(?:[:=：]|是|为)?\s*['\"]?[A-Za-z0-9._\-]{8,256}|sk-[A-Za-z0-9_-]{8,256})")),
+    Rule("url_secret", "URL 敏感参数", "high", re.compile(r"(?i)(?:token|key|secret|password|pwd)=([^&\s]{1,256})")),
+    Rule("prompt_injection", "提示注入风险", "high", re.compile(r"(?i)(忽略.{0,40}(?:规则|指令|限制)|泄露.{0,40}(?:系统提示词|system prompt)|ignore (?:all )?(?:previous|prior) instructions|reveal (?:the )?system prompt|developer message|jailbreak)")),
 ]
 
 
@@ -65,13 +65,30 @@ def _mask_value(value: str, type_name: str, stable_map: dict[str, str], mode: st
     if type_name == "password":
         return re.sub(r"([:=：]\s*)['\"]?[^\s,'\";，。]{4,}", r"\1[PASSWORD]", compact, count=1)
     if type_name == "db_credential":
-        return re.sub(r"(://[^:@\s'\"<>]*:)[^@\s'\"<>]+(@)", r"\1[PASSWORD]\2", compact, count=1)
+        # Mask both the username and the password, keep scheme + host topology
+        # only minimally (user is sensitive too: e.g. root).
+        return re.sub(
+            r"(://)[^:@\s'\"<>]*:[^@\s'\"<>]+(@)",
+            r"\1[CREDENTIAL]\2",
+            compact,
+            count=1,
+        )
     if type_name == "id_card" and len(compact) >= 15:
         return compact[:6] + "********" + compact[-4:]
     if type_name == "bank_card":
         digits = re.sub(r"\D", "", compact)
         return "**** **** **** " + digits[-4:] if len(digits) >= 4 else "[BANK_CARD]"
     return f"[{type_name.upper()}]"
+
+
+def _mask_evidence(value: str, type_name: str) -> str:
+    """Produce a display-safe version of a matched value for the findings report.
+
+    The report must never echo the raw secret back to the client, even when the
+    chosen mode is placeholder/remove. We always use the masking strategy (which
+    keeps only minimal context such as the last 4 digits) and truncate."""
+    masked = _mask_value(value, type_name, {}, "mask")
+    return masked[:120]
 
 
 def scan_text(text: str, mode: str = "mask", location: str | None = None) -> tuple[str, list[dict]]:
@@ -101,11 +118,15 @@ def scan_text(text: str, mode: str = "mask", location: str | None = None) -> tup
                 "type": rule.type,
                 "label": rule.label,
                 "severity": rule.severity,
-                "evidence": original[:120],
+                "evidence": _mask_evidence(original, rule.type),
                 "replacement": replacement,
                 "start": start,
                 "end": end,
                 "location": location,
+                # Internal-only: the raw matched text, used by the PDF redactor
+                # to locate the span on the page. Never serialized to clients
+                # (FileScanResponse/Finding does not declare this field).
+                "_raw": original,
             }
         )
 

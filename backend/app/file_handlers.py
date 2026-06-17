@@ -2,10 +2,9 @@ from __future__ import annotations
 
 import csv
 import re
-import shutil
 import uuid
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import fitz
 from docx import Document
@@ -21,7 +20,7 @@ UPLOAD_DIR = STORAGE_DIR / "uploads"
 REDACTED_DIR = STORAGE_DIR / "redacted"
 
 for directory in (UPLOAD_DIR, REDACTED_DIR):
-    directory.mkdir(parents=True, exist_ok=True)
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
 
 
 SUPPORTED_EXTENSIONS = {".txt", ".csv", ".docx", ".xlsx", ".pdf", ".pptx"}
@@ -30,9 +29,17 @@ OFFICE_EXTENSIONS = {".docx", ".xlsx", ".pptx"}
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 MAX_OFFICE_UNCOMPRESSED_BYTES = 100 * 1024 * 1024
 MAX_OFFICE_FILE_COUNT = 1000
+MAX_OFFICE_COMPRESSION_RATIO = 100
 MAX_EXTRACTED_TEXT_CHARS = 500_000
+MAX_TOTAL_TEXT_CHARS = 2_000_000
+MAX_CELL_CHARS = 32_768
 MAX_PDF_PAGES = 200
-FORMULA_PREFIXES = ("=", "+", "-", "@")
+FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r", "|", "%")
+ZERO_WIDTH_CHARS = ("​", "‌", "‍", "﻿", "⁠")
+# Office parts that indicate embedded macros — refuse these outright.
+MACRO_PART_MARKERS = ("vbaproject.bin", "vbadata.xml")
+
+csv.field_size_limit(MAX_CELL_CHARS)
 
 
 def save_upload(filename: str, content: bytes) -> Path:
@@ -59,34 +66,54 @@ def redact_file(source: Path, original_filename: str, mode: str = "mask") -> dic
         raise ValueError(f"不支持的文件类型：{suffix}")
     _validate_saved_file(source, suffix)
 
-    target = REDACTED_DIR / _redacted_filename(original_filename, suffix)
+    # On-disk name is an unguessable UUID (prevents cross-user overwrite and
+    # enumeration); the friendly "*-fixed.ext" name is only used for download.
+    target = REDACTED_DIR / f"{uuid.uuid4().hex}{suffix}"
+    download_name = _redacted_filename(original_filename, suffix)
+
     if suffix == ".txt":
         text = _limit_text(source.read_text(encoding="utf-8", errors="ignore"))
         redacted, findings = scan_text(text, mode, "全文")
         target.write_text(redacted, encoding="utf-8")
-        return {"path": target, "preview": _preview(redacted), "findings": findings}
+        result = {"path": target, "preview": _preview(redacted), "findings": findings}
+    elif suffix == ".csv":
+        result = _redact_csv(source, target, mode)
+    elif suffix == ".xlsx":
+        result = _redact_xlsx(source, target, mode)
+    elif suffix == ".docx":
+        result = _redact_docx(source, target, mode)
+    elif suffix == ".pdf":
+        result = _redact_pdf(source, target, mode)
+    elif suffix == ".pptx":
+        result = _redact_pptx(source, target, mode)
+    else:
+        raise ValueError(f"不支持的文件类型：{suffix}")
 
-    if suffix == ".csv":
-        return _redact_csv(source, target, mode)
-    if suffix == ".xlsx":
-        return _redact_xlsx(source, target, mode)
-    if suffix == ".docx":
-        return _redact_docx(source, target, mode)
-    if suffix == ".pdf":
-        return _redact_pdf(source, target, mode)
-    if suffix == ".pptx":
-        return _redact_pptx(source, target, mode)
+    result["download_name"] = download_name
+    return result
 
-    raise ValueError(f"不支持的文件类型：{suffix}")
+
+_WINDOWS_RESERVED = {
+    "con", "prn", "aux", "nul",
+    *(f"com{i}" for i in range(1, 10)),
+    *(f"lpt{i}" for i in range(1, 10)),
+}
 
 
 def _redacted_filename(original_filename: str, fallback_suffix: str) -> str:
     original_path = Path(original_filename)
     suffix = original_path.suffix.lower() or fallback_suffix
     stem = original_path.stem or "redacted"
-    safe_stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", stem).strip(" .")
-    if not safe_stem:
+    # Restrict to a safe ASCII/CJK whitelist: drop control chars, path
+    # separators, zero-width and any reserved/format characters that could
+    # forge a look-alike or escape the directory.
+    safe_stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", stem)
+    safe_stem = re.sub(r"[​‌‍⁠﻿  ]", "", safe_stem)
+    safe_stem = safe_stem.strip(" .")
+    if not safe_stem or safe_stem.lower() in _WINDOWS_RESERVED:
         safe_stem = "redacted"
+    # Cap length to stay well under filesystem limits.
+    safe_stem = safe_stem[:120]
     return f"{safe_stem}-fixed{suffix}"
 
 
@@ -101,23 +128,45 @@ def _validate_file_signature(suffix: str, content: bytes) -> None:
 
 def _validate_saved_file(path: Path, suffix: str) -> None:
     if suffix in OFFICE_EXTENSIONS:
-        _validate_office_zip(path)
+        _validate_office_zip(path, suffix)
 
 
-def _validate_office_zip(path: Path) -> None:
+def _validate_office_zip(path: Path, suffix: str) -> None:
+    # Each Office type must contain its declared main part; this also blocks a
+    # renamed xlsx-as-docx etc. and any plain zip masquerading as Office.
+    required_part = {
+        ".docx": "word/document.xml",
+        ".xlsx": "xl/workbook.xml",
+        ".pptx": "ppt/presentation.xml",
+    }[suffix]
     try:
         with zipfile.ZipFile(path) as archive:
             infos = archive.infolist()
             if len(infos) > MAX_OFFICE_FILE_COUNT:
                 raise ValueError("Office 文件内部文件数量异常，已拒绝处理")
-            total_size = 0
+
+            names = {item.filename.replace("\\", "/").lower() for item in infos}
+            if required_part not in names:
+                raise ValueError("Office 文件结构与扩展名不匹配，已拒绝处理")
+            if any(any(marker in name for marker in MACRO_PART_MARKERS) for name in names):
+                raise ValueError("Office 文件包含宏，出于安全考虑已拒绝处理")
+
+            total_uncompressed = 0
+            total_compressed = 0
             for item in infos:
                 name = item.filename.replace("\\", "/")
-                if name.startswith("/") or ".." in Path(name).parts:
+                pure = PurePosixPath(name)
+                if pure.is_absolute() or ".." in pure.parts or ":" in name:
                     raise ValueError("Office 文件包含异常路径，已拒绝处理")
-                total_size += item.file_size
-                if total_size > MAX_OFFICE_UNCOMPRESSED_BYTES:
+                total_uncompressed += item.file_size
+                total_compressed += item.compress_size
+                if total_uncompressed > MAX_OFFICE_UNCOMPRESSED_BYTES:
                     raise ValueError("Office 文件解压后体积过大，已拒绝处理")
+            # file_size in the header is attacker-controlled; cross-check the
+            # overall compression ratio to catch declared-small / actually-huge
+            # zip bombs.
+            if total_compressed > 0 and total_uncompressed / total_compressed > MAX_OFFICE_COMPRESSION_RATIO:
+                raise ValueError("Office 文件压缩比异常，疑似压缩炸弹，已拒绝处理")
     except zipfile.BadZipFile as exc:
         raise ValueError("Office 文件结构损坏或格式不正确") from exc
 
@@ -128,11 +177,29 @@ def _limit_text(text: str) -> str:
     return text
 
 
+class _TotalTextGuard:
+    """Bounds the cumulative extracted text across a whole document so that
+    many small-but-numerous segments can't bypass the per-segment limit."""
+
+    def __init__(self) -> None:
+        self._total = 0
+
+    def add(self, text: str) -> str:
+        text = _limit_text(text)
+        self._total += len(text)
+        if self._total > MAX_TOTAL_TEXT_CHARS:
+            raise ValueError("文件整体文本量过大，已拒绝处理")
+        return text
+
+
 def _neutralize_spreadsheet_formula(value: str) -> str:
-    stripped = value.lstrip()
+    # Strip zero-width / BOM chars first so they can't hide a leading formula
+    # trigger from the prefix check.
+    cleaned = re.sub(r"[​‌‍⁠﻿]", "", value)
+    stripped = cleaned.lstrip()
     if stripped and stripped[0] in FORMULA_PREFIXES:
-        return "'" + value
-    return value
+        return "'" + cleaned
+    return cleaned
 
 
 def _redact_csv(source: Path, target: Path, mode: str) -> dict:
@@ -141,10 +208,12 @@ def _redact_csv(source: Path, target: Path, mode: str) -> dict:
     with source.open("r", encoding="utf-8-sig", errors="ignore", newline="") as src:
         rows = list(csv.reader(src))
 
+    guard = _TotalTextGuard()
     redacted_rows = []
     for row_idx, row in enumerate(rows, start=1):
         new_row = []
         for col_idx, value in enumerate(row, start=1):
+            value = guard.add(value)
             redacted, cell_findings = scan_text(value, mode, f"第 {row_idx} 行，第 {col_idx} 列")
             findings.extend(cell_findings)
             new_row.append(_neutralize_spreadsheet_formula(redacted))
@@ -153,7 +222,7 @@ def _redact_csv(source: Path, target: Path, mode: str) -> dict:
             preview_rows.append(", ".join(new_row))
 
     with target.open("w", encoding="utf-8-sig", newline="") as dst:
-        csv.writer(dst).writerows(redacted_rows)
+        csv.writer(dst, quoting=csv.QUOTE_ALL).writerows(redacted_rows)
 
     return {"path": target, "preview": _preview("\n".join(preview_rows)), "findings": findings}
 
@@ -162,13 +231,19 @@ def _redact_xlsx(source: Path, target: Path, mode: str) -> dict:
     workbook = load_workbook(source)
     findings: list[dict] = []
     preview_lines: list[str] = []
+    guard = _TotalTextGuard()
 
     for sheet in workbook.worksheets:
         for row in sheet.iter_rows():
             values = []
             for cell in row:
+                # Neutralize any formula already present in the source workbook
+                # (data_type 'f') even if it carries no detected secret.
+                if cell.data_type == "f" and isinstance(cell.value, str):
+                    cell.value = "'" + cell.value
                 if isinstance(cell.value, str):
-                    redacted, cell_findings = scan_text(cell.value, mode, f"{sheet.title}!{cell.coordinate}")
+                    text = guard.add(cell.value)
+                    redacted, cell_findings = scan_text(text, mode, f"{sheet.title}!{cell.coordinate}")
                     findings.extend(cell_findings)
                     cell.value = _neutralize_spreadsheet_formula(redacted)
                 values.append("" if cell.value is None else str(cell.value))
@@ -183,9 +258,10 @@ def _redact_docx(source: Path, target: Path, mode: str) -> dict:
     document = Document(source)
     findings: list[dict] = []
     preview_lines: list[str] = []
+    guard = _TotalTextGuard()
 
     for index, paragraph in enumerate(document.paragraphs, start=1):
-        text = _limit_text(paragraph.text)
+        text = guard.add(paragraph.text)
         redacted, para_findings = scan_text(text, mode, f"第 {index} 段")
         if para_findings:
             _replace_paragraph_text(paragraph, redacted)
@@ -196,7 +272,7 @@ def _redact_docx(source: Path, target: Path, mode: str) -> dict:
     for table_idx, table in enumerate(document.tables, start=1):
         for row_idx, row in enumerate(table.rows, start=1):
             for col_idx, cell in enumerate(row.cells, start=1):
-                text = _limit_text(cell.text)
+                text = guard.add(cell.text)
                 redacted, cell_findings = scan_text(text, mode, f"表 {table_idx} 行 {row_idx} 列 {col_idx}")
                 if cell_findings:
                     cell.text = redacted
@@ -216,42 +292,50 @@ def _replace_paragraph_text(paragraph, text: str) -> None:
 
 
 def _redact_pdf(source: Path, target: Path, mode: str) -> dict:
-    doc = fitz.open(source)
     findings: list[dict] = []
     preview_lines: list[str] = []
-    if len(doc) > MAX_PDF_PAGES:
+    guard = _TotalTextGuard()
+    doc = fitz.open(source)
+    try:
+        if doc.needs_pass:
+            raise ValueError("PDF 已加密，无法处理")
+        if len(doc) > MAX_PDF_PAGES:
+            raise ValueError("PDF 页数过多，已拒绝处理")
+
+        for page_index in range(len(doc)):
+            page = doc[page_index]
+            text = guard.add(page.get_text())
+            redacted, page_findings = scan_text(text, mode, f"第 {page_index + 1} 页")
+            findings.extend(page_findings)
+            if redacted.strip() and len(preview_lines) < 20:
+                preview_lines.append(redacted)
+            for item in page_findings:
+                # Search for the raw matched text (evidence is masked for display).
+                raw = item.get("_raw") or item["evidence"]
+                for rect in page.search_for(raw):
+                    page.add_redact_annot(rect, text=item["replacement"], fill=(1, 1, 1))
+            page.apply_redactions()
+
+        # garbage/clean strip orphaned objects, JS, embedded files left behind.
+        doc.save(target, garbage=4, deflate=True, clean=True)
+    finally:
         doc.close()
-        raise ValueError("PDF 页数过多，已拒绝处理")
-
-    for page_index in range(len(doc)):
-        page = doc[page_index]
-        text = _limit_text(page.get_text())
-        redacted, page_findings = scan_text(text, mode, f"第 {page_index + 1} 页")
-        findings.extend(page_findings)
-        if redacted.strip() and len(preview_lines) < 20:
-            preview_lines.append(redacted)
-        for item in page_findings:
-            evidence = item["evidence"]
-            for rect in page.search_for(evidence):
-                page.add_redact_annot(rect, text=item["replacement"], fill=(1, 1, 1))
-        page.apply_redactions()
-
-    doc.save(target)
-    doc.close()
     return {"path": target, "preview": _preview("\n".join(preview_lines)), "findings": findings}
 
 
 def _redact_pptx(source: Path, target: Path, mode: str) -> dict:
-    shutil.copy2(source, target)
-    presentation = Presentation(target)
+    # Open the source and only write target on success, so a partial failure
+    # never leaves an un-redacted file named "*-fixed.pptx".
+    presentation = Presentation(source)
     findings: list[dict] = []
     preview_lines: list[str] = []
+    guard = _TotalTextGuard()
 
     for slide_idx, slide in enumerate(presentation.slides, start=1):
         for shape_idx, shape in enumerate(slide.shapes, start=1):
             if not hasattr(shape, "text") or not shape.text:
                 continue
-            text = _limit_text(shape.text)
+            text = guard.add(shape.text)
             redacted, shape_findings = scan_text(text, mode, f"第 {slide_idx} 页，元素 {shape_idx}")
             if shape_findings:
                 shape.text = redacted
